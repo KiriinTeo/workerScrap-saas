@@ -216,3 +216,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+odds_reais.json
+odds_sportingbet.json
+test_scraper.py

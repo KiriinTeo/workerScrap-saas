@@ -31,4 +31,4 @@ def bulk_insert_odds(db: Session, odds_list: list[dict]):
     
     db.bulk_insert_mappings(OddHistory, odds_list)
     db.commit()
-    print(f"✅ {len(odds_list)} novas odds inseridas com sucesso no histórico!")
+    print(f"{len(odds_list)} novas odds inseridas com sucesso no histórico!")
