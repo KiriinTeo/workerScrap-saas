@@ -217,6 +217,8 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
+# Test JSONS
 odds_reais.json
 odds_sportingbet.json
 test_scraper.py
+betano_deep_dump.json

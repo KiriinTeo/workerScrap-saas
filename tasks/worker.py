@@ -24,6 +24,6 @@ def process_betmgm_data():
         # 3. bulk_insert_odds(...)
         
     except Exception as e:
-        print(f"❌ Erro na BetMGM: {e}")
+        print(f"Erro na BetMGM: {e}")
     finally:
         db.close() 
