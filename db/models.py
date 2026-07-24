@@ -40,3 +40,20 @@ class OddHistory(Base):
 
     match = relationship("Match", back_populates="odds")
     bookmaker = relationship("Bookmaker", back_populates="odds")
+
+class LatestOddsView(Base):
+    __tablename__ = 'latest_odds_view'
+
+    __table_args__ = {'info': dict(is_view=True)} 
+
+    id = Column(Integer, primary_key=True)
+    match_id = Column(Integer)
+    bookmaker_id = Column(Integer)
+    market = Column(String)
+    selection = Column(String)
+    odd_value = Column(Float)
+    created_at = Column(DateTime)
+
+    __mapper_args__ = {
+        'primary_key': [match_id, bookmaker_id, market, selection]
+    }

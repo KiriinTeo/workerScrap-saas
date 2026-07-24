@@ -1,6 +1,7 @@
 from tasks.celery_app import celery_app
 from config.database import SessionLocal
-# from scrapers.betmgm import scrape_betmgm  <-- Descomentaremos quando o scraper estiver pronto
+from sqlalchemy import text
+# from scrapers.betmgm import scrape_betmgm  
 
 @celery_app.task(name="tasks.worker.run_all_scrapers")
 def run_all_scrapers():
@@ -27,3 +28,14 @@ def process_betmgm_data():
         print(f"Erro na BetMGM: {e}")
     finally:
         db.close() 
+
+def refresh_materialized_views():
+    db = SessionLocal()
+    try:
+        db.execute(text("REFRESH MATERIALIZED VIEW CONCURRENTLY latest_odds_view"))
+        db.commit()
+        print("Materialized View atualizada com as novas odds!")
+    except Exception as e:
+        print(f"Erro ao atualizar View: {e}")
+    finally:
+        db.close()

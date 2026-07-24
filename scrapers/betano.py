@@ -99,7 +99,6 @@ class BetanoScraper(BaseScraper):
         await self.init_browser()
         await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         
-        # Loop Mestre
         for url in self.target_urls:
             await self.extract_single(url)
             self.transform_and_load()

@@ -76,8 +76,11 @@ class SportingbetScraper(BaseScraper):
                         for option in options:
                             selection_name = option.get("name", {}).get("value", "Selecao")
                             price_data = option.get("price", {})
+
+                            if selection_name == "X":
+                                selection_name = "Empate"
                             
-                            odd_value = price_data.get("decimalOdds") or price_data.get("oddsValue")
+                            odd_value = price_data.get("odds") or price_data.get("oddsValue")
                             
                             if not odd_value:
                                 num = price_data.get("numerator")
