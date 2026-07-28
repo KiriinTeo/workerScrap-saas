@@ -71,17 +71,29 @@ class SportingbetScraper(BaseScraper):
                     
                     markets = fixture.get("optionMarkets", [])
                     for market in markets:
-                        market_name = market.get("name", {}).get("value", "Mercado")
+                        market_name = market.get("name", {}).get("value", "").strip()
+                        
+                        market_type = ""
+                        if any(m in market_name for m in ["Resultado da partida", "Tempo Regulamentar", "1X2"]):
+                            market_type = "1X2"
+                        elif any(m in market_name for m in ["Ambas as equipes marcam", "Ambas Marcam"]):
+                            market_type = "BTTS"
+                        elif any(m in market_name for m in ["Total de gols", "Mais/Menos"]):
+                            market_type = "Over/Under"
+                        else:
+                            continue
+                            
+                        is_super_odd = False 
+                        
                         options = market.get("options", [])
                         for option in options:
-                            selection_name = option.get("name", {}).get("value", "Selecao")
+                            selection_name = option.get("name", {}).get("value", "").strip()
                             price_data = option.get("price", {})
 
-                            if selection_name == "X":
+                            if selection_name in ["X", "x", "v", "vs", "VS", "V"]:
                                 selection_name = "Empate"
                             
                             odd_value = price_data.get("odds") or price_data.get("oddsValue")
-                            
                             if not odd_value:
                                 num = price_data.get("numerator")
                                 den = price_data.get("denominator")
@@ -92,9 +104,10 @@ class SportingbetScraper(BaseScraper):
                                 odds_to_insert.append({
                                     "match_id": match.id,
                                     "bookmaker_id": bookmaker.id,
-                                    "market": market_name,
+                                    "market": market_type,
                                     "selection": selection_name,
-                                    "odd_value": float(odd_value)
+                                    "odd_value": float(odd_value),
+                                    "is_super_odd": is_super_odd
                                 })
             
             if odds_to_insert:

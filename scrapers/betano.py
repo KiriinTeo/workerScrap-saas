@@ -70,19 +70,36 @@ class BetanoScraper(BaseScraper):
                 
                 markets = event.get("markets", [])
                 for market in markets:
-                    market_name = market.get("name", "Mercado Desconhecido")
+                    market_name = market.get("name", "").strip()
+                    
+                    market_type = ""
+                    if market_name in ["Resultado Final", "Vencedor da Partida"]:
+                        market_type = "1X2"
+                    elif "Ambas equipes marcam" in market_name or "Ambas Marcam" in market_name:
+                        market_type = "BTTS"
+                    elif "Mais/Menos" in market_name or "Total de Gols" in market_name:
+                        market_type = "Over/Under"
+                    else:
+                        continue
+                        
+                    is_super_odd = market.get("isSuperOdds", False)
+                    
                     selections = market.get("selections", [])
                     for selection in selections:
                         selection_name = selection.get("fullName", "") or selection.get("name", "")
                         odd_value = selection.get("price", 0.0)
+
+                        if selection_name in ["X", "x", "v", "vs", "VS", "V"]:
+                            selection_name = "Empate"
                         
                         if odd_value > 0:
                             odds_to_insert.append({
                                 "match_id": match.id,
                                 "bookmaker_id": bookmaker.id,
-                                "market": market_name,
-                                "selection": selection_name,
-                                "odd_value": float(odd_value)
+                                "market": market_type,
+                                "selection": selection_name.strip(),
+                                "odd_value": float(odd_value),
+                                "is_super_odd": is_super_odd
                             })
                             
             if odds_to_insert:

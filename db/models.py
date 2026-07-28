@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, UniqueConstraint
+from sqlalchemy import Boolean, Column, Integer, String, Float, DateTime, ForeignKey, UniqueConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime, timezone
 from config.database import Base
@@ -36,6 +36,7 @@ class OddHistory(Base):
     market = Column(String, nullable=False)
     selection = Column(String, nullable=False)
     odd_value = Column(Float, nullable=False)
+    is_super_odd = Column(Boolean, default=False)
     collected_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0), index=True)
 
     match = relationship("Match", back_populates="odds")
