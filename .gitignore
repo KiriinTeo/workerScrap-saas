@@ -224,3 +224,6 @@ test_scraper.py
 betano_deep_dump.json
 kto_dump.json
 vaidebet_dump.json
+debug_betfair_html.html
+debug_betfair_prices.json
+betfair_dump.json

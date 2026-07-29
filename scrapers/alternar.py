@@ -17,10 +17,13 @@ class AltenarScraper(BaseScraper):
         if response.status == 200 and 'json' in response.headers.get('content-type', '').lower():
             try:
                 data = await response.json()
-                str_data = str(data).lower()
                 
-                if 'topsports' not in str_data and 'markets' in str_data and ('events' in str_data or 'runners' in str_data):
-                    self.raw_data = data
+                if isinstance(data, dict) and 'events' in data and 'markets' in data:
+                    
+                    if len(data.get('events', [])) > 0:
+                        self.raw_data = data
+                        print(f"[+] Payload rico interceptado! {len(data['events'])} eventos encontrados.")
+                        
             except Exception:
                 pass
 
@@ -51,7 +54,7 @@ class AltenarScraper(BaseScraper):
 
     def transform_and_load(self):
         if not self.raw_data:
-            print(f"Nenhum dado com odds reais interceptado na {self.bookmaker_name}.")
+            print(f"Nenhum dado interceptado na {self.bookmaker_name}.")
             return
 
         db = SessionLocal()
@@ -59,20 +62,24 @@ class AltenarScraper(BaseScraper):
             bookmaker = get_or_create_bookmaker(db, self.bookmaker_name, self.bookmaker_base_url)
             odds_to_insert = []
             
-            events = self._find_events(self.raw_data)
-            processed_events = set()
+            events_raw = self.raw_data.get("events", [])
+            markets_raw = {m.get("id"): m for m in self.raw_data.get("markets", [])}
+            odds_raw = {o.get("id"): o for o in self.raw_data.get("odds", [])}
             
-            for event in events:
-                event_id = event.get("id")
-                if event_id:
-                    if event_id in processed_events: continue
-                    processed_events.add(event_id)
+            if not events_raw:
+                print("Nenhum evento encontrado no dump da Altenar. Gerando Dump...")
+                with open(f"{self.bookmaker_name.lower()}_dump.json", "w", encoding="utf-8") as f:
+                    json.dump(self.raw_data, f, indent=4, ensure_ascii=False)
+                return
 
+            for event in events_raw:
                 name_str = event.get("name", "")
-                if not name_str or " vs " not in name_str:
+                if not name_str or " vs. " not in name_str:
                     continue
                     
-                home_team, away_team = name_str.split(" vs ", 1)
+                home_team, away_team = name_str.split(" vs. ", 1)
+                home_team = home_team.strip()
+                away_team = away_team.strip()
                 
                 start_time_str = event.get("startDate")
                 start_time = datetime.now(timezone.utc)
@@ -82,46 +89,63 @@ class AltenarScraper(BaseScraper):
                     except ValueError:
                         pass
                         
-                match = get_or_create_match(db, home_team.strip(), away_team.strip(), "Futebol", start_time)
+                match = get_or_create_match(db, home_team, away_team, "Futebol", start_time)
                 
-                markets = event.get("markets", [])
-                for market in markets:
-                    market_name = market.get("name", "").strip()
-                    
+                market_ids = event.get("marketIds", [])
+                for m_id in market_ids:
+                    market = markets_raw.get(m_id)
+                    if not market: continue
+                        
+                    market_name = market.get("name", "").strip().upper()
                     market_type = ""
-                    if any(m in market_name for m in ["1x2", "1X2", "Vencedor", "Match Result", "Resultado"]):
+                 
+                    if any(m in market_name for m in ["VENCEDOR DO ENCONTRO", "1X2", "MATCH RESULT", "RESULTADO DA PARTIDA"]):
                         market_type = "1X2"
-                    elif any(m in market_name for m in ["Ambas", "BTTS", "marcam", "Equipas Marcam"]):
+                    elif any(m in market_name for m in ["AMBAS AS EQUIPAS MARCAM", "BTTS"]):
                         market_type = "BTTS"
-                    elif any(m in market_name for m in ["Total", "Mais/Menos", "Over/Under", "Gols"]):
-                        market_type = "Over/Under"
                     else:
-                        continue
+                        continue 
                         
-                    is_super_odd = market.get("isSuperOdd", False)
-                    
-                    selections = market.get("runners", [])
-                    for selection in selections:
-                        selection_name = selection.get("name", "").strip()
-                        odd_value = selection.get("price", 0.0)
+                    odd_ids = market.get("oddIds", [])
+                    for o_id in odd_ids:
+                        odd_data = odds_raw.get(o_id)
+                        if not odd_data: continue
+                            
+                        if odd_data.get("oddStatus") != 0: 
+                            continue
+                            
+                        odd_value = odd_data.get("price", 0.0)
+                        raw_selection_name = odd_data.get("name", "").strip()
                         
-                        if odd_value and float(odd_value) > 0:
+                        is_super_odd = odd_data.get("isDBB", False)
+                        
+                        if odd_value and float(odd_value) > 1.0:
+                            selection = raw_selection_name
+                            if market_type == "1X2":
+                                type_id = odd_data.get("typeId")
+                                if type_id == 1 or raw_selection_name == home_team:
+                                    selection = "1"
+                                elif type_id == 2 or "Empate" in raw_selection_name or "Draw" in raw_selection_name:
+                                    selection = "X"
+                                elif type_id == 3 or raw_selection_name == away_team:
+                                    selection = "2"
+                            
                             odds_to_insert.append({
                                 "match_id": match.id,
                                 "bookmaker_id": bookmaker.id,
                                 "market": market_type,
-                                "selection": selection_name,
+                                "selection": selection,
                                 "odd_value": float(odd_value),
                                 "is_super_odd": bool(is_super_odd)
                             })
                             
             if odds_to_insert:
                 bulk_insert_odds(db, odds_to_insert)
-                print(f"Sucesso: {len(odds_to_insert)} odds da {self.bookmaker_name} inseridas.")
-            else:
-                print(f"Eventos encontrados, mas sem odds para o Duplo Green. Gerando Dump...")
+                print(f"Sucesso: {len(odds_to_insert)} odds da {self.bookmaker_name} inseridas no banco.")
                 with open(f"{self.bookmaker_name.lower()}_dump.json", "w", encoding="utf-8") as f:
-                    json.dump(self.raw_data, f, indent=4, ensure_ascii=False)
+                                    json.dump(self.raw_data, f, indent=4, ensure_ascii=False)
+            else:
+                print(f"Eventos encontrados, mas sem odds de 1X2 ou BTTS para o Duplo Green.")
 
         except Exception as e:
             print(f"Erro na {self.bookmaker_name}: {e}")

@@ -79,7 +79,7 @@ class KambiScraper(BaseScraper):
             if not offers:
                 with open(f"{self.bookmaker_name.lower()}_dump.json", "w", encoding="utf-8") as f:
                     json.dump(self.raw_data, f, indent=4, ensure_ascii=False)
-                print("Nenhuma oferta legivel encontrada. Dump gerado.")
+                print("Nenhuma oferta legível encontrada. Dump gerado.")
                 return
 
             processed_offers = set()
@@ -92,22 +92,27 @@ class KambiScraper(BaseScraper):
                 
                 event_id = offer.get("eventId")
                 event_info = events_map.get(event_id)
+                
                 if not event_info:
                     for ev in events_raw:
-                        if ev.get("event", {}).get("id") == event_id:
-                            event_info = ev.get("event")
+                        ev_data = ev.get("event") if "event" in ev else ev
+                        if ev_data.get("id") == event_id:
+                            event_info = ev_data
                             break
                             
                 if not event_info: continue
 
-                name_str = event_info.get("name", "")
-                if not name_str: continue
-                    
-                home_team, away_team = name_str, "Adversario"
-                for sep in [" - ", " v ", " vs "]:
-                    if sep in name_str:
-                        home_team, away_team = name_str.split(sep, 1)
-                        break
+                home_team = event_info.get("homeName")
+                away_team = event_info.get("awayName")
+                
+                if not home_team or not away_team:
+                    name_str = event_info.get("name", "")
+                    if not name_str: continue
+                    home_team, away_team = name_str, "Adversário"
+                    for sep in [" - ", " v ", " vs "]:
+                        if sep in name_str:
+                            home_team, away_team = name_str.split(sep, 1)
+                            break
                 
                 start_time_str = event_info.get("start")
                 start_time = datetime.now(timezone.utc)
@@ -120,28 +125,31 @@ class KambiScraper(BaseScraper):
                 match = get_or_create_match(db, home_team.strip(), away_team.strip(), "Futebol", start_time)
                 
                 criterion = offer.get("criterion", {})
-                market_name = criterion.get("englishLabel") or criterion.get("label", "")
-                if not market_name:
-                    offer_type = offer.get("betOfferType", {})
-                    market_name = offer_type.get("englishName") or offer_type.get("name", "")
+                bet_offer_type = offer.get("betOfferType", {})
                 
+                market_label = criterion.get("englishLabel") or criterion.get("label", "")
+                type_name = bet_offer_type.get("englishName") or bet_offer_type.get("name", "")
+                
+                market_str = f"{market_label} {type_name}".upper()
                 market_type = ""
-                if any(m in market_name for m in ["Match Odds", "Full Time", "1x2", "Tempo Regulamentar", "Resultado"]):
-                    market_type = "1X2"
-                elif any(m in market_name for m in ["Both Teams To Score", "Ambas as equipes marcam", "Ambas"]):
-                    market_type = "BTTS"
-                elif any(m in market_name for m in ["Total Goals", "Total de Gols", "Mais de/Menos de"]):
-                    market_type = "Over/Under"
-                else:
-                    continue
                 
+                if any(m in market_str for m in ["MATCH ODDS", "FULL TIME", "1X2", "TEMPO REGULAMENTAR"]):
+                    market_type = "1X2"
+                elif any(m in market_str for m in ["BOTH TEAMS TO SCORE", "AMBAS"]):
+                    market_type = "BTTS"
+                else:
+                    continue 
+                
+                offer_tags = offer.get("tags", [])
+                is_super_odd = any(tag in offer_tags for tag in ["PRICE_BOOST", "BOOSTED", "ODDS_BOOST"])
+
                 outcomes = offer.get("outcomes", [])
                 for outcome in outcomes:
                     selection_name = outcome.get("englishLabel") or outcome.get("label", "")
                     odd_raw = outcome.get("odds", 0)
                     
                     if odd_raw > 0:
-                        odd_value = odd_raw / 1000.0 if odd_raw > 1000 else float(odd_raw)
+                        odd_value = odd_raw / 1000.0
                         
                         odds_to_insert.append({
                             "match_id": match.id,
@@ -149,14 +157,14 @@ class KambiScraper(BaseScraper):
                             "market": market_type,
                             "selection": selection_name.strip(),
                             "odd_value": odd_value,
-                            "is_super_odd": False
+                            "is_super_odd": is_super_odd
                         })
                             
             if odds_to_insert:
                 bulk_insert_odds(db, odds_to_insert)
                 print(f"Sucesso: {len(odds_to_insert)} odds da {self.bookmaker_name} inseridas no banco.")
             else:
-                print(f"Eventos encontrados, mas sem odds no filtro Duplo Green.")
+                print(f"Eventos encontrados, mas sem odds no filtro de interesse (1X2/BTTS).")
 
         except Exception as e:
             print(f"Erro na {self.bookmaker_name}: {e}")
