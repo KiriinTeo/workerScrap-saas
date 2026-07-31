@@ -1,5 +1,6 @@
 import asyncio
 import json
+import traceback
 from datetime import datetime, timezone
 from scrapers.base_scraper import BaseScraper
 from db.crud import get_or_create_bookmaker, get_or_create_match, bulk_insert_odds
@@ -39,6 +40,17 @@ class KambiScraper(BaseScraper):
             
         self.page.remove_listener("response", self.intercept_odds)
 
+    def _generate_debug_dump(self, reason="unknown"):
+        if self.raw_data:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"debug_{self.bookmaker_name.lower()}_{reason}_{timestamp}.json"
+            try:
+                with open(filename, "w", encoding="utf-8") as f:
+                    json.dump(self.raw_data, f, indent=4, ensure_ascii=False)
+                print(f"[!] Dump de debug gerado: {filename} (Motivo: {reason})")
+            except Exception as e:
+                print(f"Falha ao gerar dump de debug: {e}")
+
     def _extract_offers_from_events(self, events_list):
         offers = []
         events_map = {}
@@ -66,9 +78,10 @@ class KambiScraper(BaseScraper):
             return
 
         db = SessionLocal()
+        odds_to_insert = []
+        
         try:
             bookmaker = get_or_create_bookmaker(db, self.bookmaker_name, self.bookmaker_base_url)
-            odds_to_insert = []
             
             events_raw = self.raw_data.get("events", [])
             bet_offers_raw = self.raw_data.get("betOffers", [])
@@ -77,9 +90,8 @@ class KambiScraper(BaseScraper):
             offers.extend(bet_offers_raw)
             
             if not offers:
-                with open(f"{self.bookmaker_name.lower()}_dump.json", "w", encoding="utf-8") as f:
-                    json.dump(self.raw_data, f, indent=4, ensure_ascii=False)
-                print("Nenhuma oferta legível encontrada. Dump gerado.")
+                print("Nenhuma oferta legível encontrada.")
+                self._generate_debug_dump(reason="no_offers")
                 return
 
             processed_offers = set()
@@ -122,52 +134,75 @@ class KambiScraper(BaseScraper):
                     except ValueError:
                         pass
                 
-                match = get_or_create_match(db, home_team.strip(), away_team.strip(), "Futebol", start_time)
-                
                 criterion = offer.get("criterion", {})
                 bet_offer_type = offer.get("betOfferType", {})
                 
                 market_label = criterion.get("englishLabel") or criterion.get("label", "")
                 type_name = bet_offer_type.get("englishName") or bet_offer_type.get("name", "")
-                
                 market_str = f"{market_label} {type_name}".upper()
-                market_type = ""
                 
-                if any(m in market_str for m in ["MATCH ODDS", "FULL TIME", "1X2", "TEMPO REGULAMENTAR"]):
-                    market_type = "1X2"
-                elif any(m in market_str for m in ["BOTH TEAMS TO SCORE", "AMBAS"]):
-                    market_type = "BTTS"
-                else:
+                if not any(m in market_str for m in ["MATCH ODDS", "FULL TIME", "1X2", "TEMPO REGULAMENTAR"]):
                     continue 
                 
                 offer_tags = offer.get("tags", [])
+                
                 is_super_odd = any(tag in offer_tags for tag in ["PRICE_BOOST", "BOOSTED", "ODDS_BOOST"])
+                has_early_payout = any(tag in offer_tags for tag in ["EARLY_PAYOUT"]) or "EARLY PAYOUT" in market_str
+                
+                match = get_or_create_match(db, home_team.strip(), away_team.strip(), "Futebol", start_time)
 
                 outcomes = offer.get("outcomes", [])
                 for outcome in outcomes:
-                    selection_name = outcome.get("englishLabel") or outcome.get("label", "")
                     odd_raw = outcome.get("odds", 0)
-                    
-                    if odd_raw > 0:
-                        odd_value = odd_raw / 1000.0
+                    if odd_raw <= 1000: 
+                        continue
                         
-                        odds_to_insert.append({
-                            "match_id": match.id,
-                            "bookmaker_id": bookmaker.id,
-                            "market": market_type,
-                            "selection": selection_name.strip(),
-                            "odd_value": odd_value,
-                            "is_super_odd": is_super_odd
-                        })
+                    type_str = outcome.get("type", "")
+                    label_str = (outcome.get("englishLabel") or outcome.get("label", "")).upper()
+                    
+                    selection = None
+                    if type_str == "HOME_RACING" or label_str in ["1", home_team.upper()]:
+                        selection = "1"
+                    elif type_str == "DRAW" or label_str in ["X", "DRAW", "EMPATE"]:
+                        selection = "X"
+                    elif type_str == "AWAY_RACING" or label_str in ["2", away_team.upper()]:
+                        selection = "2"
+
+                    if not selection:
+                        continue
+
+                    is_vitoria = selection in ["1", "2"]
+                    is_empate = selection == "X"
+
+                    if is_vitoria and not has_early_payout:
+                        continue
+                    
+                    if is_empate and not is_super_odd:
+                        continue
+                        
+                    odd_value = odd_raw / 1000.0
+                    
+                    odds_to_insert.append({
+                        "match_id": match.id,
+                        "bookmaker_id": bookmaker.id,
+                        "market": "1X2",
+                        "selection": selection,
+                        "odd_value": odd_value,
+                        "is_super_odd": bool(is_super_odd)
+                    })
                             
             if odds_to_insert:
                 bulk_insert_odds(db, odds_to_insert)
-                print(f"Sucesso: {len(odds_to_insert)} odds da {self.bookmaker_name} inseridas no banco.")
+                print(f"Sucesso: {len(odds_to_insert)} odds filtradas da {self.bookmaker_name} inseridas no banco.")
+                self._generate_debug_dump(reason="success")
             else:
-                print(f"Eventos encontrados, mas sem odds no filtro de interesse (1X2/BTTS).")
+                print(f"Eventos processados, mas nenhuma odd passou no filtro restrito (Vitória+EP ou Empate+SuperOdd).")
+                self._generate_debug_dump(reason="no_valid_odds")
 
         except Exception as e:
-            print(f"Erro na {self.bookmaker_name}: {e}")
+            print(f"Erro no processamento da {self.bookmaker_name}: {e}")
+            traceback.print_exc()
+            self._generate_debug_dump(reason="exception_raised")
         finally:
             db.close()
 
