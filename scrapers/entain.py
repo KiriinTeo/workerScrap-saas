@@ -2,6 +2,7 @@ import asyncio
 import json
 import re
 import traceback
+from collections import Counter
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from scrapers.base_scraper import BaseScraper
@@ -14,164 +15,140 @@ class EntainScraper(BaseScraper):
         self.target_urls = target_urls if isinstance(target_urls, list) else [target_urls]
         self.bookmaker_name = bookmaker_name
         self.bookmaker_base_url = bookmaker_base_url
-        self.raw_data = []
-        self.html_content = ""
+        self.list_json_payloads = []
+        self.match_json_payloads = []
 
-    @staticmethod
-    def _extract_balanced_json_objects(text, anchor):
-        objects = []
-        for m in re.finditer(re.escape(anchor), text):
-            start = text.rfind('{', 0, m.start())
-            if start == -1: continue
-            depth, in_string, escape, end = 0, False, False, None
-            for i in range(start, len(text)):
-                ch = text[i]
-                if in_string:
-                    if escape: escape = False
-                    elif ch == '\\': escape = True
-                    elif ch == '"': in_string = False
-                    continue
-                if ch == '"': in_string = True
-                elif ch == '{': depth += 1
-                elif ch == '}':
-                    depth -= 1
-                    if depth == 0:
-                        end = i + 1
-                        break
-            if end: objects.append(text[start:end])
-        return objects
+    async def _intercept_list(self, response):
+        if response.status == 200 and 'json' in response.headers.get('content-type', '').lower():
+            try:
+                data = await response.json()
+                self.list_json_payloads.append(data)
+            except Exception:
+                pass
+
+    def _extract_main_league_urls(self, base_url):
+        fixtures = []
+        def _find(data):
+            if isinstance(data, dict):
+                if "fixtures" in data and isinstance(data["fixtures"], list):
+                    for f in data["fixtures"]:
+                        if "id" in f:
+                            fixtures.append(f)
+                for v in data.values():
+                    _find(v)
+            elif isinstance(data, list):
+                for i in data:
+                    _find(i)
+
+        _find(self.list_json_payloads)
+        
+        if not fixtures:
+            return set()
+
+        league_keys = ["tournamentId", "competitionId", "leagueId", "categoryId", "sportId"]
+        target_fixtures = fixtures
+
+        for key in league_keys:
+            counts = Counter([str(f[key]) for f in fixtures if key in f])
+            if counts:
+                main_league_id = counts.most_common(1)[0][0]
+                target_fixtures = [f for f in fixtures if str(f.get(key)) == main_league_id]
+                break
+
+        urls = set()
+        for f in target_fixtures:
+            u = f.get("url") or f.get("eventUrl")
+            if u and 'outright' not in str(u).lower():
+                clean = str(u)
+                if not clean.startswith('/'): clean = f"/{clean}"
+                urls.add(f"{base_url}{clean}")
+            else:
+                urls.add(f"{base_url}/pt-br/sports/eventos/{f['id']}")
+                
+        return urls
 
     async def get_match_urls(self, url):
-        """Usa Força Bruta (Regex) no HTML bruto para caçar qualquer vestígio de URL de partida."""
-        urls_encontradas = set()
+        self.list_json_payloads = []
+        self.page.on("response", self._intercept_list)
+        
+        parsed_url = urlparse(url)
+        base = f"{parsed_url.scheme}://{parsed_url.netloc}"
 
         try:
             print(f"Acessando listagem Entain ({self.bookmaker_name}): {url}")
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             
-            # Scroll para garantir que scripts de lazy-load injetem as variáveis no HTML
-            for _ in range(4):
+            for _ in range(5):
                 await self.page.evaluate("window.scrollBy(0, 1500)")
                 await self.page.wait_for_timeout(2000)
 
-            # Extração de Força Bruta no HTML inteiro
-            html_content = await self.page.content()
-            
-            # Limpa escapes de JSON caso existam (ex: \/sports\/events -> /sports/events)
-            clean_html = html_content.replace('\\/', '/')
-            
-            # Regex matadora: procura qualquer coisa parecida com /pt-br/sports/events/partida-xxxx
-            regex_matches = re.findall(r'(/[a-zA-Z0-9\-]+/sports/events/:]+)', clean_html)
-            
-            for match in regex_matches:
-                if 'outright' not in match.lower():
-                    urls_encontradas.add(match)
+        except Exception:
+            pass
+        finally:
+            self.page.remove_listener("response", self._intercept_list)
 
-            # DOM Tradicional Fallback
-            dom_hrefs = await self.page.evaluate('''() => {
-                let urls = [];
-                document.querySelectorAll('a').forEach(a => {
-                    let href = a.getAttribute('href');
-                    if (href && href.includes('/events/') && !href.includes('outright')) {
-                        urls.push(href);
-                    }
-                });
-                return urls;
-            }''')
-            
-            for dh in dom_hrefs:
-                urls_encontradas.add(dh)
+        final_urls = self._extract_main_league_urls(base)
+        return list(final_urls)
 
-        except Exception as e:
-            print(f"Erro ao extrair URLs da listagem: {e}")
-
-        parsed_url = urlparse(url)
-        base = f"{parsed_url.scheme}://{parsed_url.netloc}"
-        
-        final_urls = []
-        for path in urls_encontradas:
-            clean_path = path if path.startswith('/') else f"/{path}"
-            final_urls.append(f"{base}{clean_path}")
-
-        return list(set(final_urls))
-
-    async def intercept_odds(self, response):
+    async def _intercept_match(self, response):
         if response.status == 200 and 'json' in response.headers.get('content-type', '').lower():
             try:
                 data = await response.json()
-                if isinstance(data, dict):
-                    str_data = str(data)
-                    if "optionMarkets" in str_data or "fixtures" in str_data:
-                        self.raw_data.append(data)
+                if "optionMarkets" in str(data):
+                    self.match_json_payloads.append(data)
             except Exception:
                 pass
 
     async def extract_single(self, url):
-        self.raw_data = []
-        self.html_content = ""
-        self.page.on("response", self.intercept_odds)
+        self.match_json_payloads = []
+        self.page.on("response", self._intercept_match)
 
         try:
             print(f"Acessando partida interna: {url}")
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             await self.page.wait_for_timeout(6000)
-            
-            # HTML para SSR Fallback da página interna (onde mora o "VP")
-            self.html_content = await self.page.content()
-        except Exception as e:
-            print(f"Erro ao acessar {url}: {e}")
-        finally:
-            self.page.remove_listener("response", self.intercept_odds)
-
-    def _generate_debug_dump(self, reason="unknown"):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        try:
-            if self.raw_data:
-                filename = f"debug_entain_{self.bookmaker_name.lower()}_network_{reason}_{timestamp}.json"
-                with open(filename, "w", encoding="utf-8") as f:
-                    json.dump(self.raw_data, f, indent=4, ensure_ascii=False)
-            
-            if self.html_content and reason in ["no_fixtures_in_match_page", "no_valid_odds_vp"]:
-                html_filename = f"debug_entain_{self.bookmaker_name.lower()}_ssr_{reason}_{timestamp}.html"
-                with open(html_filename, "w", encoding="utf-8") as f:
-                    f.write(self.html_content)
-                
-            print(f"[!] Dump de debug gerado (Motivo: {reason})")
         except Exception:
             pass
+        finally:
+            self.page.remove_listener("response", self._intercept_match)
 
-    def _find_fixtures(self, data, fixtures_list, seen_ids):
+    def _generate_debug_dump(self, reason="unknown"):
+        if self.match_json_payloads:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"debug_entain_{self.bookmaker_name.lower()}_{reason}_{timestamp}.json"
+            try:
+                with open(filename, "w", encoding="utf-8") as f:
+                    json.dump(self.match_json_payloads, f, indent=4, ensure_ascii=False)
+                print(f"[!] Dump de debug gerado: {filename} (Motivo: {reason})")
+            except Exception:
+                pass
+
+    def _find_fixtures_data(self, data, fixtures_list, seen_ids):
         if isinstance(data, dict):
-            if "optionMarkets" in data and "homeName" in data and "awayName" in data:
-                f_id = data.get("id")
-                if f_id and f_id not in seen_ids:
+            if "optionMarkets" in data and "id" in data:
+                f_id = str(data.get("id"))
+                if f_id not in seen_ids:
                     seen_ids.add(f_id)
                     fixtures_list.append(data)
-            for key, value in data.items():
-                self._find_fixtures(value, fixtures_list, seen_ids)
+            for value in data.values():
+                self._find_fixtures_data(value, fixtures_list, seen_ids)
         elif isinstance(data, list):
             for item in data:
-                self._find_fixtures(item, fixtures_list, seen_ids)
+                self._find_fixtures_data(item, fixtures_list, seen_ids)
 
     def transform_and_load(self):
+        if not self.match_json_payloads:
+            return
+
         db = SessionLocal()
-        odds_to_insert = []
+        unique_odds = {}
         fixtures = []
         seen_ids = set()
         
-        self._find_fixtures(self.raw_data, fixtures, seen_ids)
-        
-        if self.html_content:
-            for candidate in self._extract_balanced_json_objects(self.html_content, '"optionMarkets"'):
-                try:
-                    obj = json.loads(candidate)
-                    self._find_fixtures(obj, fixtures, seen_ids)
-                except Exception:
-                    continue
+        self._find_fixtures_data(self.match_json_payloads, fixtures, seen_ids)
 
         if not fixtures:
-            print(f"Falha total: Nenhum dado de jogo localizado.")
-            self._generate_debug_dump(reason="no_fixtures_in_match_page")
+            self._generate_debug_dump(reason="no_fixtures_found")
             return
 
         try:
@@ -181,7 +158,18 @@ class EntainScraper(BaseScraper):
                 home_team = fixture.get("homeName", "").strip()
                 away_team = fixture.get("awayName", "").strip()
                 
-                if not home_team or not away_team: continue
+                if not home_team or not away_team:
+                    f_name = fixture.get("name", {}).get("value", "")
+                    if " - " in f_name:
+                        parts = f_name.split(" - ", 1)
+                        home_team, away_team = parts[0].strip(), parts[1].strip()
+                    elif " v " in f_name.lower() or " vs " in f_name.lower():
+                        parts = re.split(r'\s+vs?\s+', f_name, maxsplit=1, flags=re.IGNORECASE)
+                        if len(parts) == 2:
+                            home_team, away_team = parts[0].strip(), parts[1].strip()
+
+                if not home_team or not away_team: 
+                    continue
                     
                 start_time_str = fixture.get("startDate")
                 start_time = datetime.now(timezone.utc)
@@ -195,25 +183,27 @@ class EntainScraper(BaseScraper):
                 for market in option_markets:
                     market_name = market.get("name", {"value": ""}).get("value", "").upper()
                     
-                    if not any(m in market_name for m in ["RESULTADO DA PARTIDA", "1X2", "MATCH RESULT", "VENCEDOR"]):
+                    valid_markets = ["RESULTADO DA PARTIDA", "1X2", "MATCH RESULT", "VENCEDOR", "TEMPO REGULAMENTAR"]
+                    if not any(m in market_name for m in valid_markets):
                         continue
                     
-                    has_early_payout = any(term in market_name for term in ["PAGAMENTO ANTECIPADO", "VANTAGEM", "EARLY PAYOUT", "(VP)", " VP"])
+                    has_early_payout = any(term in market_name for term in ["VP+2", " VP", "(VP)", "VANTAGEM", "PAGAMENTO ANTECIPADO"])
                     
                     options = market.get("options", [])
                     for option in options:
-                        odd_value = 0.0
                         price_data = option.get("price", {})
-                        if price_data:
-                            num = price_data.get("numerator")
-                            den = price_data.get("denominator")
-                            if num is not None and den is not None and den != 0:
-                                odd_value = (float(num) / float(den)) + 1.0
-
+                        if not price_data: continue
+                            
+                        num = price_data.get("numerator")
+                        den = price_data.get("denominator")
+                        if num is None or den is None or den == 0: continue
+                            
+                        odd_value = (float(num) / float(den)) + 1.0
                         if odd_value <= 1.0: continue
 
                         raw_selection_name = option.get("name", {"value": ""}).get("value", "").strip().upper()
-                        is_super_odd = option.get("isBoosted", False) or any(b in market_name for b in ["BOOST", "AUMENTADA", "TURBINADA", "MELHORADA"])
+                        
+                        is_super_odd = option.get("isBoosted", False) or any(b in market_name for b in ["BOOST", "SUPER ODD", "AUMENTADA"])
                         
                         sel_code = None
                         if raw_selection_name in ["1", home_team.upper()]: sel_code = "1"
@@ -228,25 +218,25 @@ class EntainScraper(BaseScraper):
                         if is_vitoria and not has_early_payout: continue
                         if is_empate and not is_super_odd: continue
 
-                        odds_to_insert.append({
-                            "match_id": match.id,
-                            "bookmaker_id": bookmaker.id,
-                            "market": "1X2",
-                            "selection": sel_code,
-                            "odd_value": float(odd_value),
-                            "is_super_odd": bool(is_super_odd)
-                        })
+                        odd_key = f"{match.id}_{sel_code}"
+                        
+                        if odd_key not in unique_odds or has_early_payout or is_super_odd:
+                            unique_odds[odd_key] = {
+                                "match_id": match.id,
+                                "bookmaker_id": bookmaker.id,
+                                "market": "1X2",
+                                "selection": sel_code,
+                                "odd_value": float(odd_value),
+                                "is_super_odd": bool(is_super_odd)
+                            }
+                        
+            odds_to_insert = list(unique_odds.values())
                         
             if odds_to_insert:
                 bulk_insert_odds(db, odds_to_insert)
-                print(f"Sucesso: {len(odds_to_insert)} odds restritas da {self.bookmaker_name} salvas.")
-                self._generate_debug_dump(reason="valid_odds_saved")
-            else:
-                print(f"Eventos processados. Nenhuma seleção passou nos filtros rigorosos de VP/SuperOdd.")
-                self._generate_debug_dump(reason="no_valid_odds_vp")
+                print(f"Sucesso: {len(odds_to_insert)} odds restritas salvas ({self.bookmaker_name}).")
 
-        except Exception as e:
-            print(f"Erro no processamento da {self.bookmaker_name}: {e}")
+        except Exception:
             traceback.print_exc()
             self._generate_debug_dump(reason="exception_raised")
         finally:
@@ -258,7 +248,7 @@ class EntainScraper(BaseScraper):
         
         for base_url in self.target_urls:
             match_urls = await self.get_match_urls(base_url)
-            print(f"[-] {len(match_urls)} URLs extraídas brutalmente do HTML. Iniciando escaneamento profundo...")
+            print(f"[-] {len(match_urls)} URLs da liga principal forjadas. Iniciando escaneamento profundo...")
             
             for match_url in match_urls:
                 await self.extract_single(match_url)
