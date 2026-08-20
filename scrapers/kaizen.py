@@ -1,158 +1,101 @@
-import asyncio
 import json
-import traceback
-from datetime import datetime, timezone
-from scrapers.base_scraper import BaseScraper
-from db.crud import get_or_create_bookmaker, get_or_create_match, bulk_insert_odds
-from config.database import SessionLocal
+from .base_scraper import BaseScraper
 
 class KaizenScraper(BaseScraper):
-    def __init__(self, target_urls, bookmaker_name, bookmaker_base_url, headless=False):
-        super().__init__(headless)
-        self.target_urls = target_urls if isinstance(target_urls, list) else [target_urls]
-        self.bookmaker_name = bookmaker_name
-        self.bookmaker_base_url = bookmaker_base_url
-        self.raw_data = None
+    def __init__(self, headless=True):
+        super().__init__('betano', headless)
 
-    async def extract_single(self, url):
-        self.raw_data = None
-        try:
-            print(f"Acessando provedor Kaizen ({self.bookmaker_name}): {url}")
-            await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            await self.page.wait_for_timeout(5000)
-            
-            ssr_data = await self.page.evaluate("() => window.initial_state || window.INITIAL_STATE")
-            if ssr_data:
-                self.raw_data = ssr_data
-        except Exception as e:
-            print(f"Erro ao acessar {url}: {e}")
-
-    def _generate_debug_dump(self, reason="unknown"):
-        if self.raw_data:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"debug_kaizen_{self.bookmaker_name.lower()}_{reason}_{timestamp}.json"
+    async def intercept_odds(self, response):
+        if response.status == 200 and 'json' in response.headers.get('content-type', '').lower():
             try:
-                with open(filename, "w", encoding="utf-8") as f:
-                    json.dump(self.raw_data, f, indent=4, ensure_ascii=False)
-                print(f"[!] Dump de debug gerado: {filename} (Motivo: {reason})")
-            except Exception as e:
-                print(f"Falha ao salvar dump de debug: {e}")
+                if 'api' in response.url:
+                    data = await response.json()
+                    if 'data' in data and ('blocks' in data['data'] or 'events' in str(data)):
+                        self.raw_data = data
+            except Exception:
+                pass
 
-    def _find_events(self, data, events_list):
-        if isinstance(data, dict):
-            if "markets" in data and "name" in data and "startTime" in data and "id" in data:
-                events_list.append(data)
-            for key, value in data.items():
-                self._find_events(value, events_list)
-        elif isinstance(data, list):
-            for item in data:
-                self._find_events(item, events_list)
+    async def scrape(self, url, save_dump=False):
+        self.raw_data = None
+        self.page.on("response", self.intercept_odds)
 
-    def transform_and_load(self):
-        if not self.raw_data:
-            print(f"Nenhum dado interceptado na {self.bookmaker_name}.")
-            return
-
-        db = SessionLocal()
-        odds_to_insert = []
-        events_raw = []
+        await self.page.goto(url, wait_until="domcontentloaded")
+        await self.page.wait_for_timeout(8000) 
         
-        self._find_events(self.raw_data, events_raw)
-        
-        if not events_raw:
-            self._generate_debug_dump(reason="no_events")
-            return
+        self.page.remove_listener("response", self.intercept_odds)
 
+        if save_dump and self.raw_data:
+            with open(f"dumps/{self.house_name}_raw_dump.json", "w", encoding="utf-8") as f:
+                json.dump(self.raw_data, f, indent=2, ensure_ascii=False)
+            print(f"Dump da {self.house_name.upper()} gerado com sucesso!")
+        elif save_dump:
+            print(f"Falha: Nenhum dado capturado no interceptor da {self.house_name.upper()}.")
+
+        await self._parse_kaizen_data()
+
+    async def _parse_kaizen_data(self, data):
         try:
-            bookmaker = get_or_create_bookmaker(db, self.bookmaker_name, self.bookmaker_base_url)
+            events = data.get('data', {}).get('events', []) 
+            
+            if not events:
+                events = self._find_events_recursively(data)
 
-            for event in events_raw:
-                event_name = event.get("name", "")
-                if not event_name or (" - " not in event_name and " vs " not in event_name.lower()):
+            for event in events:
+                match_id = event.get('id')
+                
+                if not match_id or 'name' not in event:
                     continue
-                    
-                sep = " - " if " - " in event_name else " vs "
-                parts = event_name.split(sep, 1)
-                home_team, away_team = parts[0].strip(), parts[1].strip()
+
+                teams = event['name'].split(' - ')
+                if len(teams) != 2:
+                    continue
                 
-                start_time = datetime.now(timezone.utc)
-                start_time_raw = event.get("startTime")
-                if start_time_raw:
-                    try:
-                        start_time = datetime.fromtimestamp(start_time_raw / 1000.0, tz=timezone.utc)
-                    except Exception:
-                        pass
-                        
-                match = get_or_create_match(db, home_team, away_team, "Futebol", start_time)
-                
-                markets = event.get("markets", [])
+                home_team, away_team = teams[0].strip(), teams[1].strip()
+                markets = event.get('markets', [])
+
                 for market in markets:
-                    market_name = market.get("name", "").strip().upper()
-                    
-                    if not any(m in market_name for m in ["RESULTADO FINAL", "1X2", "MATCH RESULT", "VENCEDOR"]):
-                        continue 
+                    market_name = market.get('name', '').lower()
+                    if 'resultado final' not in market_name and market.get('type') != 'MR':
+                        continue
+
+                    selections = market.get('selections', [])
+                    for sel in selections:
+                        sel_name = sel.get('name')
+                        odd_value = sel.get('price')
+
+                        tags = sel.get('tags', [])
                         
-                    is_super_odd = market.get("isSuperOdds", False)
-                    has_early_payout = any(term in market_name for term in ["2 GOLS", "VANTAGEM", "PAGAMENTO ANTECIPADO", "EARLY PAYOUT"])
-                        
-                    selections = market.get("selections", [])
-                    for selection in selections:
-                        raw_sel_name = selection.get("name", "").strip().upper()
-                        odd_value = selection.get("price", 0.0)
-                        
-                        if not odd_value or float(odd_value) <= 1.0:
-                            continue
+                        has_early_payout = False
+                        is_super_odd = False
+
+                        if sel.get('isEarlyPayout') == True or "EP" in tags or "2GoalsAhead" in tags:
+                            has_early_payout = True
                             
-                        sel_code = None
-                        if raw_sel_name in ["1", home_team.upper()]:
-                            sel_code = "1"
-                        elif raw_sel_name in ["X", "EMPATE", "DRAW"]:
-                            sel_code = "X"
-                        elif raw_sel_name in ["2", away_team.upper()]:
-                            sel_code = "2"
-                            
-                        if not sel_code:
-                            continue
+                        if sel.get('isSuperOdds') == True or "SO" in tags or market.get('hasSuperOdds') == True:
+                            is_super_odd = True
 
-                        is_vitoria = sel_code in ["1", "2"]
-                        is_empate = sel_code == "X"
-
-                        if is_vitoria and not has_early_payout:
-                            continue 
-                        
-                        if is_empate and not is_super_odd:
-                            continue 
-
-                        odds_to_insert.append({
-                            "match_id": match.id,
-                            "bookmaker_id": bookmaker.id,
-                            "market": "1X2",
-                            "selection": sel_code,
-                            "odd_value": float(odd_value),
-                            "is_super_odd": bool(is_super_odd)
-                        })
-                        
-            if odds_to_insert:
-                bulk_insert_odds(db, odds_to_insert)
-                print(f"Sucesso: {len(odds_to_insert)} odds filtradas do provedor Kaizen ({self.bookmaker_name}) inseridas no banco.")
-                self._generate_debug_dump(reason="success")
-            else:
-                print(f"Eventos processados, mas nenhuma odd passou no filtro restrito (Vitória+EP ou Empate+SuperOdd).")
-                self._generate_debug_dump(reason="no_valid_odds")
+                        await self.process_and_store_odd(
+                            match_id=match_id,
+                            home_team=home_team,
+                            away_team=away_team,
+                            selection_name=sel_name,
+                            odd_value=odd_value,
+                            has_early_payout=has_early_payout,
+                            is_super_odd=is_super_odd
+                        )
 
         except Exception as e:
-            print(f"Erro no processamento da {self.bookmaker_name}: {e}")
-            traceback.print_exc()
-            self._generate_debug_dump(reason="exception_raised")
-        finally:
-            db.close()
+            print(f"Erro ao parsear dados da Kaizen: {e}")
 
-    async def run(self):
-        await self.init_browser()
-        await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        
-        for url in self.target_urls:
-            await self.extract_single(url)
-            self.transform_and_load()
-            
-        await self.close_browser()
+    def _find_events_recursively(self, obj):
+        found = []
+        if isinstance(obj, dict):
+            if 'markets' in obj and 'name' in obj and 'id' in obj and 'startTime' in obj:
+                found.append(obj)
+            else:
+                for v in obj.values():
+                    found.extend(self._find_events_recursively(v))
+        elif isinstance(obj, list):
+            for item in obj:
+                found.extend(self._find_events_recursively(item))
+        return found

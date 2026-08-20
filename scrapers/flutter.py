@@ -1,18 +1,10 @@
-import asyncio
 import json
 import re
-import traceback
-from datetime import datetime, timezone
-from scrapers.base_scraper import BaseScraper
-from db.crud import get_or_create_bookmaker, get_or_create_match, bulk_insert_odds
-from config.database import SessionLocal
+from .base_scraper import BaseScraper
 
 class FlutterScraper(BaseScraper):
-    def __init__(self, target_urls, bookmaker_name, bookmaker_base_url, headless=False):
-        super().__init__(headless=headless)
-        self.target_urls = target_urls if isinstance(target_urls, list) else [target_urls]
-        self.bookmaker_name = bookmaker_name
-        self.bookmaker_base_url = bookmaker_base_url
+    def __init__(self, bookmaker_name='flutter', headless=True):
+        super().__init__(bookmaker_name, headless)
         self.prices_data = []
         self.html_content = ""
 
@@ -26,38 +18,28 @@ class FlutterScraper(BaseScraper):
             except Exception:
                 pass
 
-    async def extract_single(self, url):
+    async def scrape(self, url, save_dump=False):
         self.prices_data = []
         self.html_content = ""
         self.page.on("response", self.intercept_odds)
         
         try:
-            print(f"Acessando {self.bookmaker_name}: {url}")
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
             for _ in range(3):
                 await self.page.evaluate("window.scrollBy(0, 800)")
                 await self.page.wait_for_timeout(2000)
             
             self.html_content = await self.page.content()
-        except Exception as e:
-            print(f"Erro ao acessar {url}: {e}")
+        except Exception:
+            pass
         finally:
             self.page.remove_listener("response", self.intercept_odds)
 
-    def _generate_debug_dump(self, reason="unknown"):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        try:
-            if self.html_content:
-                html_file = f"debug_{self.bookmaker_name.lower()}_{reason}_{timestamp}.html"
-                with open(html_file, "w", encoding="utf-8") as f:
-                    f.write(self.html_content)
-            if self.prices_data:
-                json_file = f"debug_{self.bookmaker_name.lower()}_{reason}_{timestamp}.json"
-                with open(json_file, "w", encoding="utf-8") as f:
-                    json.dump(self.prices_data, f, indent=2, ensure_ascii=False)
-            print(f"[!] Dumps de debug gerados (Motivo: {reason})")
-        except Exception as e:
-            print(f"Falha ao salvar dump de debug: {e}")
+        if save_dump and self.prices_data:
+            with open(f"dumps/{self.house_name}_raw_dump.json", "w", encoding="utf-8") as f:
+                json.dump(self.prices_data, f, indent=2, ensure_ascii=False)
+
+        await self._parse_flutter_data()
 
     @staticmethod
     def _extract_balanced_json_objects(text, anchor):
@@ -124,7 +106,7 @@ class FlutterScraper(BaseScraper):
             runners = [{"selectionId": r.get("selectionId"), "runnerName": r.get("name", ""), "resultType": r.get("resultType", "")} for r in market.get("runners", [])]
             catalogue[m_id] = {
                 "marketId": m_id, "marketName": market.get("name", ""), "marketType": market.get("marketType", ""),
-                "runners": runners, "event": {"name": event.get("name", ""), "openDate": event.get("openDate"), "home": home_name, "away": away_name}
+                "runners": runners, "event": {"name": event.get("name", ""), "home": home_name, "away": away_name}
             }
 
     def _extract_catalogue_from_html(self):
@@ -179,25 +161,20 @@ class FlutterScraper(BaseScraper):
         elif isinstance(data, list):
             for item in data: self._find_prices_recursive(item, prices)
 
-    def transform_and_load(self):
+    async def _parse_flutter_data(self):
         catalogue = self._extract_catalogue_from_html()
         prices = {}
         self._find_prices_recursive(self.prices_data, prices)
 
         if not catalogue or not prices:
-            print(f"Nenhum dado de catálogo/preço interceptado na {self.bookmaker_name}.")
-            self._generate_debug_dump(reason="missing_core_data")
             return
 
-        db = SessionLocal()
-        odds_to_insert = []
-
         try:
-            bookmaker = get_or_create_bookmaker(db, self.bookmaker_name, self.bookmaker_base_url)
-
             for market_id, market_info in catalogue.items():
                 event = market_info.get("event", {})
                 event_name = event.get("name", "")
+                
+                match_id = event.get("id") or str(hash(event_name))
 
                 home_team, away_team = event.get("home"), event.get("away")
                 if not home_team or not away_team:
@@ -208,14 +185,7 @@ class FlutterScraper(BaseScraper):
                     home_team, away_team = parts
 
                 home_team, away_team = home_team.strip(), away_team.strip()
-                start_time_str = event.get("openDate")
-                start_time = datetime.now(timezone.utc)
-                if start_time_str:
-                    try: start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
-                    except ValueError: pass
-
-                match = get_or_create_match(db, home_team, away_team, "Futebol", start_time)
-
+                
                 m_type_raw = str(market_info.get("marketType", "")).upper()
                 base_type = m_type_raw.split("_-_")[0]
                 
@@ -224,7 +194,7 @@ class FlutterScraper(BaseScraper):
 
                 has_early_payout = "2_UP" in m_type_raw
 
-                runners_catalog = {str(r.get("selectionId", "")): {"name": r.get("runnerName", ""), "resultType": str(r.get("resultType", "")).upper()} 
+                runners_catalog = {str(r.get("selectionId", "")): {"name": r.get("runnerName", "")} 
                                    for r in market_info.get("runners", []) if r.get("selectionId")}
 
                 market_prices = prices.get(market_id, {})
@@ -233,7 +203,6 @@ class FlutterScraper(BaseScraper):
                     selection_id = str(runner_price.get("selectionId", ""))
                     runner_info = runners_catalog.get(selection_id, {})
                     selection_name = (runner_info.get("name") or runner_price.get("runnerName", "")).strip()
-                    result_type = runner_info.get("resultType", "")
                     
                     if not selection_name: continue
                         
@@ -262,65 +231,19 @@ class FlutterScraper(BaseScraper):
 
                         disp_odds_val = extract_odd_val(disp_odds)
                         true_odds_val = extract_odd_val(true_odds)
-
                         odd_value = disp_odds_val or true_odds_val
 
                     is_super_odd = ("BOOST" in m_type_raw) or (disp_odds_val > 0.0 and true_odds_val > 0.0 and disp_odds_val > true_odds_val)
 
                     if float(odd_value) > 1.0:
-                        selection = None
-                        RESULT_TYPE_MAP = {"HOME": "1", "AWAY": "2", "DRAW": "X"}
-                        if result_type in RESULT_TYPE_MAP:
-                            selection = RESULT_TYPE_MAP[result_type]
-                        elif selection_name.upper() == home_team.upper():
-                            selection = "1"
-                        elif selection_name.upper() == away_team.upper():
-                            selection = "2"
-                        elif any(emp in selection_name.upper() for emp in ["EMPATE", "DRAW"]):
-                            selection = "X"
-
-                        if not selection:
-                            continue
-
-                        is_vitoria = selection in ["1", "2"]
-                        is_empate = selection == "X"
-
-                        if is_vitoria and not has_early_payout:
-                            continue
-                        
-                        if is_empate and not is_super_odd:
-                            continue
-
-                        odds_to_insert.append({
-                            "match_id": match.id,
-                            "bookmaker_id": bookmaker.id,
-                            "market": "1X2",
-                            "selection": selection,
-                            "odd_value": float(odd_value),
-                            "is_super_odd": is_super_odd
-                        })
-
-            if odds_to_insert:
-                print(f"Sucesso: {len(odds_to_insert)} odds filtradas da {self.bookmaker_name} inseridas no banco.")
-                bulk_insert_odds(db, odds_to_insert)
-                self._generate_debug_dump(reason="success")
-            else:
-                print(f"Eventos encontrados, mas nenhuma odd passou no filtro restrito (Vitória+EP ou Empate+SuperOdd).")
-                self._generate_debug_dump(reason="no_valid_odds")
-
-        except Exception as e:
-            print(f"Erro na {self.bookmaker_name}: {e}")
-            traceback.print_exc()
-            self._generate_debug_dump(reason="exception_raised")
-        finally:
-            db.close()
-
-    async def run(self):
-        await self.init_browser()
-        await self.page.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
-        for url in self.target_urls:
-            await self.extract_single(url)
-            self.transform_and_load()
-
-        await self.close_browser()
+                        await self.process_and_store_odd(
+                            match_id=match_id,
+                            home_team=home_team,
+                            away_team=away_team,
+                            selection_name=selection_name,
+                            odd_value=odd_value,
+                            has_early_payout=has_early_payout,
+                            is_super_odd=is_super_odd
+                        )
+        except Exception:
+            pass

@@ -1,3 +1,5 @@
 playwright
 sqlalchemy
 celery
+asycio
+redis
