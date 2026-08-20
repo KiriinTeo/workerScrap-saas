@@ -6,23 +6,18 @@ from playwright.async_api import async_playwright
 
 class BaseScraper:
     def __init__(self, house_name, headless=True):
-        self.house_name = house_name.lower() # ex: 'betano', 'bet365'
+        self.house_name = house_name.lower()
         self.headless = headless
         
-        # recursos do playwright
         self.playwright = None
         self.browser = None
         self.context = None
         self.page = None
         
-        # conexão assíncrona com o Redis
-        self.redis = redis.from_url("redis://localhost:6379/0", decode_responses=True)
-        
-        # TTL: tempo de vida da Odd no Redis (15 minutos = 900 segundos)
+        self.redis = redis.from_url("redis://localhost:6379/0", decode_responses=True, protocol="2")
         self.ttl_seconds = 900 
 
     async def init_browser(self):
-        """inicializa o navegador blindado contra detecção básica de bots."""
         self.playwright = await async_playwright().start()
         self.browser = await self.playwright.chromium.launch(
             headless=self.headless,
@@ -37,16 +32,35 @@ class BaseScraper:
         self.page = await self.context.new_page()
 
     async def process_and_store_odd(self, match_id, home_team, away_team, selection_name, odd_value, has_early_payout, is_super_odd):
-        is_vitoria = selection_name.lower() in [home_team.lower(), away_team.lower(), '1', '2', 'home', 'away']
-        is_empate = selection_name.lower() in ['empate', 'draw', 'x']
+        print(f"[RAIO-X] Recebido: {home_team} x {away_team} | Sel: '{selection_name}' @ {odd_value} | EP: {has_early_payout} | SO: {is_super_odd}")
+
+        # Limpeza pesada de strings para evitar erros de espaços em branco ou maiúsculas
+        home_clean = home_team.lower().strip()
+        away_clean = away_team.lower().strip()
+        sel_clean = str(selection_name).lower().strip()
+
+        is_vitoria = (
+            sel_clean in ['1', '2', 'home', 'away'] or 
+            sel_clean in home_clean or 
+            home_clean in sel_clean or 
+            sel_clean in away_clean or 
+            away_clean in sel_clean
+        )
+        
+        is_empate = sel_clean in ['empate', 'draw', 'x']
 
         is_valid_opportunity = False
         if is_vitoria and has_early_payout:
             is_valid_opportunity = True
+            print(f"    APROVADO: É Vitória e tem Pagamento Antecipado!")
         elif is_empate and is_super_odd:
             is_valid_opportunity = True
+            print(f"    APROVADO: É Empate e tem Super Odd!")
+        else:
+            print(f"    REPROVADO: Não atende à regra de ouro (is_vitoria={is_vitoria}, is_empate={is_empate}).")
 
         if not is_valid_opportunity:
+            # Não salva no Redis e interrompe
             return False
 
         payload = {
@@ -63,8 +77,12 @@ class BaseScraper:
 
         redis_key = f"raw_odd:{self.house_name}:{match_id}"
         
-        await self.redis.setex(name=redis_key, time=self.ttl_seconds, value=json.dumps(payload))
-        print(f"[{self.house_name.upper()}] Odd capturada e salva: {home_team} vs {away_team} | Sel: {selection_name} @ {odd_value}")
+        try:
+            await self.redis.setex(name=redis_key, time=self.ttl_seconds, value=json.dumps(payload))
+            print(f"    SALVO NO REDIS COM SUCESSO: Chave {redis_key}")
+        except Exception as e:
+            print(f"    [ERRO REDIS] A odd foi aprovada, mas o banco falhou: {e}")
+            
         return True
 
     async def close(self):

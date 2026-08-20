@@ -18,7 +18,7 @@ SCRAPER_REGISTRY = {
 }
 
 DEFAULT_URLS = {
-    "kaizen": "https://www.betano.bet.br/sport/futebol/brasil/brasileirao-serie-a/10016/",
+    "kaizen": "https://www.betano.bet.br/sport/futebol/brasil/brasileirao-serie-a-betano/10016r/?bt=matchresult",
     "altenar": "https://www.vaidebet.bet.br/sports#/sport/66/category/593/championship/11318", 
     "kambi": "https://www.kto.bet.br/esportes/futebol/brasil/brasileirao-serie-a",
     "flutter": "https://www.betfair.bet.br/apostas/futebol/brasileir%C3%A3o-s%C3%A9rie-a/c-13",
