@@ -159,7 +159,7 @@ class KaizenScraper(BaseScraper):
 
         except Exception as e:
             import traceback
-            print(f"🚨 [ERRO PARSER] Erro crítico: {e}")
+            print(f"[ERRO PARSER] Erro crítico: {e}")
             traceback.print_exc()
 
     def _find_events_recursively(self, obj):
