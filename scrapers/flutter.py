@@ -1,12 +1,20 @@
 import json
 import re
+import traceback
+import unicodedata
 from .base_scraper import BaseScraper
 
+def normalize_name(text):
+    if not text: return ""
+    text = unicodedata.normalize('NFD', str(text)).encode('ascii', 'ignore').decode('utf-8')
+    return re.sub(r'[^a-z0-9]', '', text.lower())
+
 class FlutterScraper(BaseScraper):
-    def __init__(self, bookmaker_name='flutter', headless=True):
-        super().__init__(bookmaker_name, headless)
+    def __init__(self, headless=True):
+        super().__init__('betfair', headless)
         self.prices_data = []
         self.html_content = ""
+        self.target_comp_id = None
 
     async def intercept_odds(self, response):
         if response.status == 200 and 'json' in response.headers.get('content-type', '').lower():
@@ -21,11 +29,17 @@ class FlutterScraper(BaseScraper):
     async def scrape(self, url, save_dump=False):
         self.prices_data = []
         self.html_content = ""
+        self.target_comp_id = None
+
+        match = re.search(r'/c-(\d+)', url)
+        if match:
+            self.target_comp_id = str(match.group(1))
+
         self.page.on("response", self.intercept_odds)
         
         try:
             await self.page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            for _ in range(3):
+            for _ in range(4):
                 await self.page.evaluate("window.scrollBy(0, 800)")
                 await self.page.wait_for_timeout(2000)
             
@@ -36,8 +50,10 @@ class FlutterScraper(BaseScraper):
             self.page.remove_listener("response", self.intercept_odds)
 
         if save_dump and self.prices_data:
+            import os
+            os.makedirs("dumps", exist_ok=True)
             with open(f"dumps/{self.house_name}_raw_dump.json", "w", encoding="utf-8") as f:
-                json.dump(self.prices_data, f, indent=2, ensure_ascii=False)
+                json.dump({"payloads": self.prices_data, "ssr": {}}, f, indent=2, ensure_ascii=False)
 
         await self._parse_flutter_data()
 
@@ -167,6 +183,7 @@ class FlutterScraper(BaseScraper):
         self._find_prices_recursive(self.prices_data, prices)
 
         if not catalogue or not prices:
+            print("🚨 [ERRO FLUTTER] Catálogo ou preços ausentes.")
             return
 
         try:
@@ -185,14 +202,21 @@ class FlutterScraper(BaseScraper):
                     home_team, away_team = parts
 
                 home_team, away_team = home_team.strip(), away_team.strip()
+                home_norm = normalize_name(home_team)
+                away_norm = normalize_name(away_team)
                 
                 m_type_raw = str(market_info.get("marketType", "")).upper()
                 base_type = m_type_raw.split("_-_")[0]
                 
-                if base_type not in ["MATCH_ODDS", "FULL_TIME_RESULT", "1X2"] and "BOOST" not in m_type_raw:
+                is_main_market = base_type in ["MATCH_ODDS", "FULL_TIME_RESULT", "1X2"]
+                is_super_odd_market = "BOOST" in m_type_raw
+
+                if not is_main_market and not is_super_odd_market:
                     continue
 
                 has_early_payout = "2_UP" in m_type_raw
+                if self.target_comp_id and is_main_market:
+                    has_early_payout = True
 
                 runners_catalog = {str(r.get("selectionId", "")): {"name": r.get("runnerName", "")} 
                                    for r in market_info.get("runners", []) if r.get("selectionId")}
@@ -233,9 +257,20 @@ class FlutterScraper(BaseScraper):
                         true_odds_val = extract_odd_val(true_odds)
                         odd_value = disp_odds_val or true_odds_val
 
-                    is_super_odd = ("BOOST" in m_type_raw) or (disp_odds_val > 0.0 and true_odds_val > 0.0 and disp_odds_val > true_odds_val)
+                    is_super_odd = is_super_odd_market or (disp_odds_val > 0.0 and true_odds_val > 0.0 and disp_odds_val > true_odds_val)
 
-                    if float(odd_value) > 1.0:
+                    if odd_value <= 1.0:
+                        continue
+
+                    sel_norm = normalize_name(selection_name)
+                    
+                    is_vitoria = sel_norm in ['1', '2', 'home', 'away'] or sel_norm in home_norm or home_norm in sel_norm or sel_norm in away_norm or away_norm in sel_norm
+                    is_empate = sel_norm in ['x', 'empate', 'draw', 'thedraw', 'empates']
+                    
+                    print(f"   [RAIO-X] Recebido: {home_team} x {away_team} | Sel: '{selection_name}' ({sel_norm}) @ {odd_value} | EP: {has_early_payout} | SO: {is_super_odd}")
+
+                    if (is_vitoria and has_early_payout) or (is_empate and is_super_odd):
+                        print(f"      APROVADO!")
                         await self.process_and_store_odd(
                             match_id=match_id,
                             home_team=home_team,
@@ -245,5 +280,8 @@ class FlutterScraper(BaseScraper):
                             has_early_payout=has_early_payout,
                             is_super_odd=is_super_odd
                         )
+                    else:
+                        print(f"      REPROVADO.")
+
         except Exception:
-            pass
+            traceback.print_exc()
